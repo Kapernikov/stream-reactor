@@ -30,8 +30,10 @@ import org.apache.kafka.connect.source.SourceRecord
 import org.json4s
 import org.json4s.native.JsonParser
 
+import collection.JavaConverters._
 import scala.annotation.tailrec
 import scala.util.{Failure, Success, Try}
+import org.json.JSONObject
 
 class JsonSimpleConverter extends Converter {
   override def convert(
@@ -118,17 +120,62 @@ object JsonSimpleConverter extends StrictLogging {
     }
   }
   private def handleArray(name: String,
-                          arr: List[_root_.org.json4s.JsonAST.JValue]) = {
-    val values = new util.ArrayList[AnyRef]()
-    val sv = convert(name, arr.head)
-    values.add(sv.value())
-    arr.tail.foreach { v =>
-      values.add(convert(name, v).value())
+                          arr: List[_root_.org.json4s.JsonAST.JValue]): SchemaAndValue = {
+    if (arr.nonEmpty) {
+      val (schema, values) = arr.head match {
+        case JObject(obj) => {
+            val arr_as_objects = arr.flatMap(x => if (x.isInstanceOf[JObject]) Seq(x.asInstanceOf[JObject]) else Seq())
+            val all_fields = arr_as_objects.flatMap(_.obj)
+            val unique_fields = all_fields.foldLeft(Nil: List[JField]) {(acc,next) => { if (acc.map(_._1).contains(next._1)) acc else next :: acc}}
+            val sv = handleObject(name, unique_fields)
+            val values = arr_as_objects.map(x => {
+              convert(name, JObject(unique_fields.map(_._1).map(name => {
+                  x.obj.find(_._1 == name).orElse(Some(JField(name, JNull))).get
+              }))).value();
+
+            });
+            
+            (sv.schema(), values.asJava)
+        }
+        case default => {
+          val values = new util.ArrayList[AnyRef]()
+          val sv = convert(name, arr.head)
+          val vals = arr.foreach { v =>
+            values.add(convert(name, v).value())
+          }
+          (sv.schema(), values)
+        }
+      };
+
+      val s = SchemaBuilder.array(schema).optional().build()
+      val sc = SchemaString(schema);
+      new SchemaAndValue(s, values);
+    } else {
+      val s = SchemaBuilder.array(Schema.OPTIONAL_STRING_SCHEMA).optional().build()
+      new SchemaAndValue(s, new util.ArrayList[AnyRef]())
     }
 
-    val schema = SchemaBuilder.array(sv.schema()).optional().build()
-    new SchemaAndValue(schema, values)
   }
+
+  def SchemaString(schem: Schema): String = {
+    val t: Schema.Type = schem.`type`();
+    val ss = t.toString;
+    val x = if (schem.name == null)  "" else schem.name;
+    var s = s"[$x $ss"
+    if (t == Schema.Type.ARRAY) {
+      s += " " + SchemaString(schem.valueSchema())
+    } else if (t == Schema.Type.MAP) {
+      s += " " + SchemaString(schem.valueSchema())
+    } else if (t == Schema.Type.STRUCT) {
+      schem.fields().forEach( f => {
+        s += "{" + f.name + "=" + SchemaString(f.schema()) + "}"
+      });
+    }
+    s += "]"
+    s
+    
+  }
+
   private def handleObject(name: String,
                            values: List[(String, json4s.JValue)]) = {
     val builder = SchemaBuilder.struct().name(name.replace("/", "_"))
@@ -141,7 +188,11 @@ object JsonSimpleConverter extends StrictLogging {
     val schema = builder.build()
 
     val struct = new Struct(schema)
-    fields.foreach { case (field, v) => struct.put(field, v) }
+    fields.foreach { case (field, v) =>  {
+      val s = SchemaString(schema);
+      logger.warn(s"PUTPUT PUTPUT: $name=$s SET $field TO $v");
+      struct.put(field, v)
+     } }
 
     new SchemaAndValue(schema, struct)
   }
